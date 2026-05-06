@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cache QA Eval Tool</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f6f8;
+    color: #1a1a1a;
+    line-height: 1.4;
+  }
+  header {
+    background: #1a1a1a;
+    color: #fff;
+    padding: 12px 20px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .progress-info { font-size: 13px; color: #aaa; }
+  .nav-buttons { display: flex; gap: 8px; margin-left: auto; }
+  button {
+    background: #2563eb;
+    color: #fff;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  button:hover { background: #1d4ed8; }
+  button.secondary { background: #4b5563; }
+  button.secondary:hover { background: #374151; }
+  button.success { background: #059669; }
+  button.success:hover { background: #047857; }
+  button:disabled { background: #999; cursor: not-allowed; }
+
+  .upload-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: calc(100vh - 60px);
+    padding: 20px;
+  }
+  .upload-box {
+    background: #fff;
+    padding: 40px;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    text-align: center;
+    max-width: 500px;
+  }
+  .upload-box h2 { margin-bottom: 12px; font-size: 20px; }
+  .upload-box p { color: #6b7280; margin-bottom: 24px; font-size: 14px; }
+  .file-input {
+    border: 2px dashed #d1d5db;
+    border-radius: 6px;
+    padding: 30px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .file-input:hover { border-color: #2563eb; }
+  .file-input input { display: none; }
+  .file-input-label { color: #2563eb; font-weight: 500; }
+
+  main {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  .card {
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 12px;
+  }
+
+  .image-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .image-cell {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .image-cell-label {
+    padding: 8px 12px;
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 12px;
+    font-weight: 600;
+    color: #374151;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .image-cell-label .role-tag {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: #dbeafe;
+    color: #1e40af;
+  }
+  .image-cell-label .role-tag.populator { background: #fee2e2; color: #991b1b; }
+  .image-cell-img {
+    width: 100%;
+    height: 280px;
+    object-fit: contain;
+    background: #fff;
+    cursor: zoom-in;
+    display: block;
+  }
+  .image-error {
+    height: 280px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #9ca3af;
+    font-size: 13px;
+    background: #f9fafb;
+  }
+
+  .info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .info-block {
+    background: #f9fafb;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #e5e7eb;
+  }
+  .info-block .label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: #6b7280;
+    margin-bottom: 4px;
+  }
+  .info-block .value {
+    font-size: 13px;
+    word-break: break-all;
+    color: #1a1a1a;
+  }
+  .info-block .value a {
+    color: #2563eb;
+    text-decoration: none;
+  }
+  .info-block .value a:hover { text-decoration: underline; }
+
+  .alt-block {
+    background: #fffbeb;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #fde68a;
+    margin-bottom: 12px;
+  }
+  .alt-block:last-child { margin-bottom: 0; }
+  .alt-block .label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: #92400e;
+    margin-bottom: 4px;
+  }
+  .alt-block .value {
+    font-size: 14px;
+    color: #1a1a1a;
+  }
+
+  .label-section { display: flex; gap: 16px; flex-wrap: wrap; }
+  .label-group {
+    flex: 1;
+    min-width: 280px;
+    border: 2px solid #e5e7eb;
+    padding: 12px;
+    border-radius: 6px;
+    background: #fafafa;
+  }
+  .label-group h4 {
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: #1a1a1a;
+  }
+  .label-group .help {
+    font-size: 11px;
+    color: #6b7280;
+    margin-bottom: 8px;
+  }
+  .label-options { display: flex; flex-direction: column; gap: 6px; }
+  .label-option {
+    display: flex;
+    align-items: flex-start;
+    padding: 8px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    cursor: pointer;
+    background: #fff;
+    transition: all 0.15s;
+  }
+  .label-option:hover { border-color: #2563eb; background: #eff6ff; }
+  .label-option input { margin-right: 8px; margin-top: 2px; }
+  .label-option.selected { border-color: #2563eb; background: #dbeafe; }
+  .label-option-text { font-size: 13px; flex: 1; }
+  .label-option-text strong { display: block; }
+  .label-option-text small { color: #6b7280; font-size: 11px; }
+
+  .notes-area {
+    width: 100%;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    padding: 8px;
+    font-family: inherit;
+    font-size: 13px;
+    resize: vertical;
+    min-height: 60px;
+  }
+
+  .modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.9);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    cursor: zoom-out;
+  }
+  .modal.show { display: flex; }
+  .modal img { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+  .stats-bar {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+    font-size: 12px;
+    color: #ddd;
+  }
+  .stat-pill {
+    background: #2937; padding: 3px 8px; border-radius: 12px;
+  }
+  .stat-pill strong { color: #fff; }
+
+  .keyboard-hint {
+    position: fixed;
+    bottom: 10px;
+    right: 10px;
+    background: rgba(0,0,0,0.75);
+    color: #fff;
+    font-size: 11px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    pointer-events: none;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+    margin-left: 6px;
+  }
+  .badge.same { background: #d1fae5; color: #065f46; }
+  .badge.diff { background: #fee2e2; color: #991b1b; }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6b7280;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 Cache QA Eval</h1>
+  <div class="progress-info" id="progressInfo">No file loaded</div>
+  <div class="stats-bar" id="statsBar"></div>
+  <div class="nav-buttons">
+    <button class="secondary" id="prevBtn" disabled>← Prev</button>
+    <button class="secondary" id="nextBtn" disabled>Next →</button>
+    <button id="jumpBtn" disabled>Jump to next unlabeled</button>
+    <button class="success" id="exportBtn" disabled>💾 Export CSV</button>
+    <button class="secondary" id="resetBtn" disabled title="Clear all annotations">Reset</button>
+  </div>
+</header>
+
+<div class="upload-screen" id="uploadScreen">
+  <div class="upload-box">
+    <h2>Cache QA Evaluation Tool</h2>
+    <p>Upload your <code>qa_hits_only.csv</code> (or any qa_dataset CSV).<br>
+    Only rows where <strong>all 4 images</strong> (served base, served context,
+    populator base, populator context) are mirrored to GitHub will be loaded.</p>
+    <label class="file-input">
+      <input type="file" id="fileInput" accept=".csv">
+      <div>📂 Click to upload CSV</div>
+      <div class="file-input-label" style="margin-top:8px">or drag &amp; drop here</div>
+    </label>
+  </div>
+</div>
+
+<main id="mainArea" style="display:none">
+  <div class="card">
+    <h3>Images (click any to enlarge)</h3>
+    <div class="image-grid" id="imageGrid"></div>
+  </div>
+
+  <div class="card">
+    <h3>Website URLs</h3>
+    <div class="info-grid">
+      <div class="info-block">
+        <div class="label">Served website <span id="websiteSameBadge"></span></div>
+        <div class="value" id="servedWebsite">—</div>
+      </div>
+      <div class="info-block">
+        <div class="label">Populator website</div>
+        <div class="value" id="populatorWebsite">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Alt Text</h3>
+    <div class="alt-block">
+      <div class="label">Existing alt text on website (DOM)</div>
+      <div class="value" id="existingAlt">—</div>
+    </div>
+    <div class="alt-block">
+      <div class="label">Generated alt text (returned from cache for served image)</div>
+      <div class="value" id="generatedAlt">—</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Cache Key &amp; ETags</h3>
+    <div class="info-grid">
+      <div class="info-block">
+        <div class="label">Cache key</div>
+        <div class="value" id="cacheKey">—</div>
+      </div>
+      <div class="info-block">
+        <div class="label">Base ETag <span id="baseSameBadge"></span></div>
+        <div class="value" id="baseEtag">—</div>
+      </div>
+      <div class="info-block">
+        <div class="label">Served context ETag <span id="ctxSameBadge"></span></div>
+        <div class="value" id="servedCtxEtag">—</div>
+      </div>
+      <div class="info-block">
+        <div class="label">Populator context ETag</div>
+        <div class="value" id="populatorCtxEtag">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>QA Labels</h3>
+    <div class="label-section">
+
+      <div class="label-group">
+        <h4>1. Pair similarity (bucket)</h4>
+        <div class="help">Structural comparison of cache hit vs populator pair.</div>
+        <div class="label-options" id="bucketOptions"></div>
+      </div>
+
+      <div class="label-group">
+        <h4>2. Alt-text accuracy</h4>
+        <div class="help">Does the cached alt text actually describe the served image well?</div>
+        <div class="label-options" id="altAccuracyOptions"></div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <div class="label" style="font-size:11px;font-weight:600;text-transform:uppercase;color:#6b7280;margin-bottom:4px">Notes (optional)</div>
+      <textarea class="notes-area" id="notesField" placeholder="Any remarks for this row..."></textarea>
+    </div>
+  </div>
+
+  <div id="emptyState" class="empty-state" style="display:none">
+    <h2>No rows with all 4 images mirrored</h2>
+    <p>The CSV had no rows where all four (served base, served context, populator base, populator context)
+    were available on GitHub. Some populator images were deleted from S3 (2-day TTL) before the pipeline
+    could mirror them. Re-run the pipeline more frequently to capture them in time.</p>
+  </div>
+</main>
+
+<div class="modal" id="modal">
+  <img id="modalImg" alt="">
+</div>
+
+<div class="keyboard-hint">← → navigate · 1/2/3/4 = bucket · Q/W/E/R = alt accuracy · S = save</div>
+
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script>
+const STORAGE_KEY = 'cacheQaEvalAnnotations_v1';
+
+const BUCKETS = [
+  { key: 'B1', label: 'Bucket 1 — Same base, different website',
+    desc: 'High FP risk — context drastically different' },
+  { key: 'B2', label: 'Bucket 2 — Same site, different context',
+    desc: 'Medium FP risk — image used in different page context' },
+  { key: 'B3', label: 'Bucket 3 — Same everything (TP)',
+    desc: 'Cache hit fully justified by structure' },
+  { key: 'NA', label: 'NA / Cannot determine',
+    desc: 'Image missing, unclear, etc.' },
+];
+
+const ALT_ACCURACY = [
+  { key: 'correct', label: 'Correct',
+    desc: 'Alt text accurately describes the served image' },
+  { key: 'incorrect', label: 'Incorrect',
+    desc: 'Wrong / hallucinated / misleading' },
+  { key: 'partial', label: 'Partial',
+    desc: 'Mostly OK but missing important context info' },
+  { key: 'NA', label: 'NA / Cannot determine',
+    desc: 'Image missing, alt missing, etc.' },
+];
+
+const state = {
+  rows: [],
+  filename: '',
+  idx: 0,
+  annotations: loadAnnotations(),
+};
+
+function loadAnnotations() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+  catch { return {}; }
+}
+function saveAnnotations() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state.annotations));
+}
+
+function rowKey(r) {
+  // Stable identifier for storage
+  return (r.image_id || '') + '|' + (r.cache_key || '');
+}
+
+function ann(r) {
+  const k = rowKey(r);
+  return state.annotations[k] || {};
+}
+function setAnn(r, patch) {
+  const k = rowKey(r);
+  state.annotations[k] = { ...(state.annotations[k] || {}), ...patch };
+  saveAnnotations();
+  updateProgress();
+}
+
+// ----- file load -----
+const fileInput = document.getElementById('fileInput');
+const uploadScreen = document.getElementById('uploadScreen');
+const mainArea = document.getElementById('mainArea');
+
+fileInput.addEventListener('change', e => loadFile(e.target.files[0]));
+document.querySelector('.file-input').addEventListener('dragover', e => { e.preventDefault(); });
+document.querySelector('.file-input').addEventListener('drop', e => {
+  e.preventDefault();
+  if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+});
+
+function loadFile(file) {
+  if (!file) return;
+  state.filename = file.name;
+  Papa.parse(file, {
+    header: true, skipEmptyLines: true,
+    complete: (results) => {
+      const all = results.data;
+      // Filter: must have BOTH served + populator info
+      const isHttp = u => typeof u === 'string' && u.startsWith('http');
+      const filtered = all.filter(r => {
+        const isServed = (r.cache_role || '').trim() === 'served' ||
+                         (r.cache_hit || '').toLowerCase() === 'true';
+        // Require ALL 4 image URLs to be loadable (GitHub mirror) so QA never hits a
+        // dead image. Rows where populator's images were deleted from S3 before the
+        // pipeline mirrored them are excluded here.
+        const allImagesOk =
+          isHttp(r.base_image_github_url) &&
+          isHttp(r.context_image_github_url) &&
+          isHttp(r.populator_base_image_github_url) &&
+          isHttp(r.populator_context_image_github_url);
+        return isServed && allImagesOk;
+      });
+      state.rows = filtered;
+      state.totalLoaded = all.length;
+      state.idx = 0;
+      uploadScreen.style.display = 'none';
+      mainArea.style.display = 'block';
+      document.getElementById('exportBtn').disabled = filtered.length === 0;
+      document.getElementById('resetBtn').disabled = false;
+      document.getElementById('prevBtn').disabled = false;
+      document.getElementById('nextBtn').disabled = false;
+      document.getElementById('jumpBtn').disabled = false;
+      if (filtered.length === 0) {
+        document.getElementById('emptyState').style.display = 'block';
+      } else {
+        render();
+      }
+    }
+  });
+}
+
+// ----- render -----
+function bestImageUrl(githubUrl, s3Url) {
+  // Prefer GitHub raw URL (always accessible). Fall back to S3 (may 403).
+  return (githubUrl && githubUrl.startsWith('http')) ? githubUrl : (s3Url || '');
+}
+
+function imageCell(label, role, githubUrl, s3Url) {
+  const url = bestImageUrl(githubUrl, s3Url);
+  const div = document.createElement('div');
+  div.className = 'image-cell';
+  const tag = role === 'populator' ? 'populator' : 'served';
+  div.innerHTML = `
+    <div class="image-cell-label">
+      <span>${label}</span>
+      <span class="role-tag ${tag}">${role}</span>
+    </div>
+    ${url
+      ? `<img class="image-cell-img" src="${url}" alt="${label}" onerror="this.outerHTML='<div class=image-error>⚠ Image failed to load</div>'" loading="lazy">`
+      : `<div class="image-error">⚠ No URL available</div>`}
+  `;
+  const img = div.querySelector('img');
+  if (img) img.addEventListener('click', () => showModal(url));
+  return div;
+}
+
+function render() {
+  if (!state.rows.length) return;
+  const r = state.rows[state.idx];
+
+  // Image grid
+  const grid = document.getElementById('imageGrid');
+  grid.innerHTML = '';
+  grid.append(
+    imageCell('Served base image',     'served',    r.base_image_github_url,           r.base_url),
+    imageCell('Populator base image',  'populator', r.populator_base_image_github_url, r.populator_base_url),
+    imageCell('Served context image',  'served',    r.context_image_github_url,        r.context_url),
+    imageCell('Populator context image','populator',r.populator_context_image_github_url, r.populator_context_url),
+  );
+
+  // Website URLs
+  setLink('servedWebsite',     r.website_url);
+  setLink('populatorWebsite',  r.populator_website_url);
+  document.getElementById('websiteSameBadge').outerHTML = sameBadge(r.website_url, r.populator_website_url, 'websiteSameBadge');
+
+  // Alt text
+  document.getElementById('existingAlt').textContent  = r.existing_alt_text || '(empty)';
+  document.getElementById('generatedAlt').textContent = r.generated_alt_text || '(empty)';
+
+  // Cache key + ETags
+  document.getElementById('cacheKey').textContent      = r.cache_key || '—';
+  document.getElementById('baseEtag').textContent      = r.base_image_etag || '—';
+  document.getElementById('servedCtxEtag').textContent = r.context_image_etag || '—';
+  document.getElementById('populatorCtxEtag').textContent = r.populator_context_image_etag || '—';
+  document.getElementById('baseSameBadge').outerHTML = sameBadge(r.base_image_etag, r.populator_base_image_etag, 'baseSameBadge');
+  document.getElementById('ctxSameBadge').outerHTML  = sameBadge(r.context_image_etag, r.populator_context_image_etag, 'ctxSameBadge');
+
+  // Render label radios
+  renderLabelOptions('bucketOptions', BUCKETS, ann(r).bucket, val => setAnn(r, { bucket: val }));
+  renderLabelOptions('altAccuracyOptions', ALT_ACCURACY, ann(r).alt_accuracy, val => setAnn(r, { alt_accuracy: val }));
+
+  // Notes
+  document.getElementById('notesField').value = ann(r).notes || '';
+  document.getElementById('notesField').oninput = e => setAnn(r, { notes: e.target.value });
+
+  updateProgress();
+}
+
+function setLink(elemId, url) {
+  const el = document.getElementById(elemId);
+  if (!url) { el.textContent = '—'; return; }
+  el.innerHTML = `<a href="${url}" target="_blank">${url}</a>`;
+}
+
+function sameBadge(a, b, id) {
+  if (!a && !b) return `<span class="badge" id="${id}"></span>`;
+  if (a === b)  return `<span class="badge same" id="${id}">SAME</span>`;
+  return `<span class="badge diff" id="${id}">DIFF</span>`;
+}
+
+function renderLabelOptions(containerId, options, current, onChange) {
+  const c = document.getElementById(containerId);
+  c.innerHTML = '';
+  options.forEach(o => {
+    const lab = document.createElement('label');
+    lab.className = 'label-option' + (current === o.key ? ' selected' : '');
+    lab.innerHTML = `
+      <input type="radio" name="${containerId}" value="${o.key}" ${current === o.key ? 'checked' : ''}>
+      <span class="label-option-text">
+        <strong>${o.label}</strong>
+        <small>${o.desc}</small>
+      </span>`;
+    lab.querySelector('input').addEventListener('change', () => {
+      onChange(o.key);
+      // refresh visual selection
+      c.querySelectorAll('.label-option').forEach(el => el.classList.remove('selected'));
+      lab.classList.add('selected');
+    });
+    c.appendChild(lab);
+  });
+}
+
+function updateProgress() {
+  const total = state.rows.length;
+  const labeledCount = state.rows.filter(r => {
+    const a = ann(r);
+    return a.bucket && a.alt_accuracy;
+  }).length;
+
+  const skipped = (state.totalLoaded || 0) - total;
+  document.getElementById('progressInfo').textContent =
+    total ? `Row ${state.idx + 1} / ${total} · ${state.filename}${skipped > 0 ? ` (${skipped} skipped — missing images)` : ''}` : '';
+
+  const stats = document.getElementById('statsBar');
+  stats.innerHTML = total
+    ? `<span class="stat-pill">Labeled <strong>${labeledCount}</strong> / ${total}</span>
+       <span class="stat-pill">Remaining <strong>${total - labeledCount}</strong></span>`
+    : '';
+}
+
+// ----- nav -----
+function nav(d) {
+  if (!state.rows.length) return;
+  state.idx = Math.max(0, Math.min(state.rows.length - 1, state.idx + d));
+  render();
+}
+function jumpToNextUnlabeled() {
+  const start = state.idx + 1;
+  for (let i = 0; i < state.rows.length; i++) {
+    const j = (start + i) % state.rows.length;
+    const a = ann(state.rows[j]);
+    if (!a.bucket || !a.alt_accuracy) {
+      state.idx = j; render(); return;
+    }
+  }
+}
+document.getElementById('prevBtn').addEventListener('click', () => nav(-1));
+document.getElementById('nextBtn').addEventListener('click', () => nav(1));
+document.getElementById('jumpBtn').addEventListener('click', jumpToNextUnlabeled);
+
+document.getElementById('resetBtn').addEventListener('click', () => {
+  if (!confirm('Clear ALL annotations? This cannot be undone.')) return;
+  state.annotations = {};
+  saveAnnotations();
+  render();
+});
+
+// ----- modal -----
+const modal = document.getElementById('modal');
+const modalImg = document.getElementById('modalImg');
+function showModal(url) {
+  if (!url) return;
+  modalImg.src = url;
+  modal.classList.add('show');
+}
+modal.addEventListener('click', () => modal.classList.remove('show'));
+
+// ----- keyboard -----
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+  if (!state.rows.length) return;
+  const r = state.rows[state.idx];
+  if (e.key === 'ArrowLeft') nav(-1);
+  else if (e.key === 'ArrowRight') nav(1);
+  else if (e.key === 'Escape') modal.classList.remove('show');
+  else if (['1','2','3','4'].includes(e.key)) {
+    const opts = ['B1','B2','B3','NA'];
+    setAnn(r, { bucket: opts[parseInt(e.key) - 1] });
+    render();
+  }
+  else if (['q','w','e','r'].includes(e.key.toLowerCase())) {
+    const opts = ['correct','incorrect','partial','NA'];
+    const map = { q: 0, w: 1, e: 2, r: 3 };
+    setAnn(r, { alt_accuracy: opts[map[e.key.toLowerCase()]] });
+    render();
+  }
+  else if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    exportCsv();
+  }
+});
+
+// ----- export -----
+function exportCsv() {
+  const headers = [
+    'served_base_image_url',     // GitHub or S3
+    'served_context_image_url',
+    'populator_base_image_url',
+    'populator_context_image_url',
+    'cache_key',
+    'existing_alt_text',
+    'generated_alt_text',
+    'served_website_url',
+    'populator_website_url',
+    'served_base_image_etag',
+    'served_context_image_etag',
+    'populator_base_image_etag',
+    'populator_context_image_etag',
+    'bucket',
+    'alt_accuracy',
+    'notes',
+  ];
+  const rowsOut = state.rows.map(r => {
+    const a = ann(r);
+    return {
+      served_base_image_url:     bestImageUrl(r.base_image_github_url, r.base_url),
+      served_context_image_url:  bestImageUrl(r.context_image_github_url, r.context_url),
+      populator_base_image_url:  bestImageUrl(r.populator_base_image_github_url, r.populator_base_url),
+      populator_context_image_url: bestImageUrl(r.populator_context_image_github_url, r.populator_context_url),
+      cache_key: r.cache_key || '',
+      existing_alt_text: r.existing_alt_text || '',
+      generated_alt_text: r.generated_alt_text || '',
+      served_website_url: r.website_url || '',
+      populator_website_url: r.populator_website_url || '',
+      served_base_image_etag: r.base_image_etag || '',
+      served_context_image_etag: r.context_image_etag || '',
+      populator_base_image_etag: r.populator_base_image_etag || '',
+      populator_context_image_etag: r.populator_context_image_etag || '',
+      bucket: a.bucket || '',
+      alt_accuracy: a.alt_accuracy || '',
+      notes: a.notes || '',
+    };
+  });
+  const csv = Papa.unparse({ fields: headers, data: rowsOut.map(r => headers.map(h => r[h])) });
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.href = url;
+  a.download = `cache_qa_eval_${ts}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+document.getElementById('exportBtn').addEventListener('click', exportCsv);
+</script>
+</body>
+</html>
