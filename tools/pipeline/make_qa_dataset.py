@@ -78,6 +78,7 @@ FINAL_FIELDS = [
     "existing_alt_text",
     "cache_key",
     "cache_role",
+    "auto_bucket",
     "cache_hit",
     "is_llm_served",
     "paired_source_image_id",
@@ -330,6 +331,7 @@ EXT_BY_MIME = {
     "image/png": ".png",
     "image/webp": ".webp",
     "image/gif": ".gif",
+    "image/svg+xml": ".svg",
 }
 
 
@@ -337,15 +339,21 @@ def sniff_ext(content_bytes, content_type=""):
     ct = (content_type or "").lower()
     if ct in EXT_BY_MIME:
         return EXT_BY_MIME[ct]
-    b = content_bytes[:16] if content_bytes else b""
-    if b[:2] == b"\xff\xd8":
+    head = content_bytes[:512] if content_bytes else b""
+    if head[:2] == b"\xff\xd8":
         return ".jpg"
-    if b[:8] == b"\x89PNG\r\n\x1a\n":
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
         return ".png"
-    if b[:4] == b"GIF8":
+    if head[:4] == b"GIF8":
         return ".gif"
-    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return ".webp"
+    try:
+        text = head.decode("utf-8", errors="ignore").lstrip().lower()
+        if text.startswith("<svg") or "<svg" in text[:200]:
+            return ".svg"
+    except Exception:
+        pass
     return ".bin"
 
 
@@ -501,32 +509,59 @@ def _join_populator_fields(rows):
             r[f"populator_{f}"] = pop.get(f, "")
 
 
-def _filter_to_primary_window(rows, days):
-    """Keep only rows whose job_created_at is within last `days` days."""
-    import datetime
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-    out = []
+def _normalize_url_parts(url):
+    """Return (hostname, path) lowercase, no trailing slash. None on parse error."""
+    if not url:
+        return None, None
+    try:
+        u = urlparse(url)
+    except Exception:
+        return None, None
+    host = (u.hostname or "").lower()
+    path = (u.path or "").rstrip("/")
+    return host, path
+
+
+def _compute_auto_bucket(served_url, pop_url):
+    """Auto-classify pair similarity from website URLs alone.
+    Returns one of: B2_diff_website, B3_diff_webpage, manual_eval (B1/B4 needed),
+    or 'unknown' when URLs are missing.
+    """
+    s_host, s_path = _normalize_url_parts(served_url)
+    p_host, p_path = _normalize_url_parts(pop_url)
+    if not s_host or not p_host:
+        return "unknown"
+    if s_host != p_host:
+        return "B2_diff_website"
+    if s_path != p_path:
+        return "B3_diff_webpage"
+    return "manual_eval"
+
+
+def phase_compute_auto_bucket(rows):
+    log("phase 3.5: auto-classifying buckets from URLs...")
+    counts = {"B2_diff_website": 0, "B3_diff_webpage": 0, "manual_eval": 0, "unknown": 0, "n/a": 0}
     for r in rows:
-        ts = r.get("job_created_at") or ""
-        if not ts:
+        if r.get("cache_role") != "served":
+            r["auto_bucket"] = ""
+            counts["n/a"] += 1
             continue
-        # parse "2026-05-05 19:56:18+00" or "...UTC"
-        ts_clean = ts.replace(" UTC", "+00:00").replace("+00", "+00:00") if "+00:00" not in ts else ts
-        try:
-            dt = datetime.datetime.fromisoformat(ts_clean)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
-            continue
-        if dt >= cutoff:
-            out.append(r)
-    return out
+        b = _compute_auto_bucket(r.get("website_url"), r.get("populator_website_url"))
+        r["auto_bucket"] = b
+        counts[b] = counts.get(b, 0) + 1
+    log(f"phase 3.5: auto-bucket distribution: {counts}")
 
 
-def phase_write_final(rows, out_csv, days, pairs_only=False, hits_only=False):
+def phase_write_final(rows, out_csv, pairs_only=False, hits_only=False, qa_only=False):
     _join_populator_fields(rows)
-    rows = _filter_to_primary_window(rows, days)
-    if hits_only:
+    phase_compute_auto_bucket(rows)
+    if qa_only:
+        # Only rows that need QA's manual eval: same website + same webpage,
+        # excluding BrowserStack's internal test group (group_id=2).
+        rows = [r for r in rows
+                if r.get("auto_bucket") == "manual_eval"
+                and str(r.get("group_id") or "").strip() != "2"]
+    elif hits_only:
         rows = [r for r in rows if r.get("cache_role") == "served"]
     elif pairs_only:
         rows = [r for r in rows if r.get("_pair_relevant")]
@@ -542,10 +577,7 @@ def phase_write_final(rows, out_csv, days, pairs_only=False, hits_only=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3,
-                    help="Output window: only rows from last N days appear in CSV (default 3)")
-    ap.add_argument("--populator-lookback-days", type=int, default=14,
-                    help="Pull this many days of jobs from BQ for populator coverage (default 14). "
-                         "Cache TTL refreshes on hit, so populators can be much older than --days.")
+                    help="Window: pull last N days of cache events (default 3)")
     ap.add_argument("--output", default="qa_dataset.csv")
     ap.add_argument("--skip-upload", action="store_true",
                     help="Skip GitHub mirroring (CSV without github_url columns filled)")
@@ -553,13 +585,15 @@ def main():
                     help="Only output rows that are part of cache pairs")
     ap.add_argument("--hits-only", action="store_true",
                     help="Only output cache_role=served rows, with populator joined side-by-side")
+    ap.add_argument("--qa-only", action="store_true",
+                    help="Only output rows that need QA's manual eval (same website + same webpage). "
+                         "Auto-classifies cross-site / cross-page pairs and excludes group_id=2.")
     ap.add_argument("--cleanup-local", action="store_true",
                     help="Delete the local repo clone after pushing (slower re-runs)")
     args = ap.parse_args()
 
-    lookback = max(args.days, args.populator_lookback_days)
-    raw_csv = os.path.join(CACHE_DIR, f"raw_{lookback}d.csv")
-    phase_bq_pull(args.days, lookback, raw_csv)
+    raw_csv = os.path.join(CACHE_DIR, f"raw_{args.days}d.csv")
+    phase_bq_pull(args.days, raw_csv)
 
     log(f"loading rows from {raw_csv}...")
     with open(raw_csv) as f:
@@ -576,7 +610,10 @@ def main():
             r["base_image_github_url"] = ""
             r["context_image_github_url"] = ""
 
-    phase_write_final(rows, args.output, pairs_only=args.pairs_only, hits_only=args.hits_only)
+    phase_write_final(rows, args.output,
+                      pairs_only=args.pairs_only,
+                      hits_only=args.hits_only,
+                      qa_only=args.qa_only)
 
     # summary
     total = len(rows)

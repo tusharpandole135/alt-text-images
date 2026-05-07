@@ -332,20 +332,6 @@
   </div>
 
   <div class="card">
-    <h3>Website URLs</h3>
-    <div class="info-grid">
-      <div class="info-block">
-        <div class="label">Served website <span id="websiteSameBadge"></span></div>
-        <div class="value" id="servedWebsite">—</div>
-      </div>
-      <div class="info-block">
-        <div class="label">Populator website</div>
-        <div class="value" id="populatorWebsite">—</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
     <h3>Alt Text</h3>
     <div class="alt-block">
       <div class="label">Existing alt text on website (DOM)</div>
@@ -380,20 +366,10 @@
   </div>
 
   <div class="card">
-    <h3>QA Labels</h3>
-    <div class="label-section">
-
-      <div class="label-group">
-        <h4>1. Pair similarity (bucket)</h4>
-        <div class="help">Structural comparison of cache hit vs populator pair.</div>
-        <div class="label-options" id="bucketOptions"></div>
-      </div>
-
-      <div class="label-group">
-        <h4>2. Alt-text accuracy</h4>
-        <div class="help">Does the cached alt text actually describe the served image well?</div>
-        <div class="label-options" id="altAccuracyOptions"></div>
-      </div>
+    <h3>Bucket assignment</h3>
+    <div class="label-group">
+      <div class="help">Compare context images side by side. Are they the same image, or different?</div>
+      <div class="label-options" id="bucketOptions"></div>
     </div>
 
     <div style="margin-top:12px">
@@ -414,32 +390,21 @@
   <img id="modalImg" alt="">
 </div>
 
-<div class="keyboard-hint">← → navigate · 1/2/3/4 = bucket · Q/W/E/R = alt accuracy · S = save</div>
+<div class="keyboard-hint">← → navigate · 1 = B1 · 4 = B4 · N = NA · Cmd+S = export</div>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script>
 const STORAGE_KEY = 'cacheQaEvalAnnotations_v1';
 
+// Only the buckets QA needs to manually distinguish (same website + same webpage).
+// "different website" (B2) and "different webpage" (B3) are auto-classified by the pipeline.
 const BUCKETS = [
-  { key: 'B1', label: 'Bucket 1 — Same base, different website',
-    desc: 'High FP risk — context drastically different' },
-  { key: 'B2', label: 'Bucket 2 — Same site, different context',
-    desc: 'Medium FP risk — image used in different page context' },
-  { key: 'B3', label: 'Bucket 3 — Same everything (TP)',
-    desc: 'Cache hit fully justified by structure' },
+  { key: 'B1', label: 'Bucket 1 — Same base, different context',
+    desc: 'Context image differs — possible FP' },
+  { key: 'B4', label: 'Bucket 4 — Same everything (TP)',
+    desc: 'Cache hit fully justified — context same' },
   { key: 'NA', label: 'NA / Cannot determine',
-    desc: 'Image missing, unclear, etc.' },
-];
-
-const ALT_ACCURACY = [
-  { key: 'correct', label: 'Correct',
-    desc: 'Alt text accurately describes the served image' },
-  { key: 'incorrect', label: 'Incorrect',
-    desc: 'Wrong / hallucinated / misleading' },
-  { key: 'partial', label: 'Partial',
-    desc: 'Mostly OK but missing important context info' },
-  { key: 'NA', label: 'NA / Cannot determine',
-    desc: 'Image missing, alt missing, etc.' },
+    desc: 'Image unclear / cannot tell' },
 ];
 
 const state = {
@@ -497,15 +462,19 @@ function loadFile(file) {
       const filtered = all.filter(r => {
         const isServed = (r.cache_role || '').trim() === 'served' ||
                          (r.cache_hit || '').toLowerCase() === 'true';
-        // Require ALL 4 image URLs to be loadable (GitHub mirror) so QA never hits a
-        // dead image. Rows where populator's images were deleted from S3 before the
-        // pipeline mirrored them are excluded here.
+        // Skip rows the pipeline already auto-classified (B2 cross-site, B3 cross-page)
+        // — QA only sees rows where the bucket truly needs visual judgment.
+        const ab = (r.auto_bucket || '').trim();
+        const needsManual = ab === 'manual_eval' || ab === '';
+        // Exclude BrowserStack's internal test group from QA eval.
+        const notInternal = String(r.group_id || '').trim() !== '2';
+        // All 4 images must be loadable on GitHub.
         const allImagesOk =
           isHttp(r.base_image_github_url) &&
           isHttp(r.context_image_github_url) &&
           isHttp(r.populator_base_image_github_url) &&
           isHttp(r.populator_context_image_github_url);
-        return isServed && allImagesOk;
+        return isServed && needsManual && notInternal && allImagesOk;
       });
       state.rows = filtered;
       state.totalLoaded = all.length;
@@ -565,11 +534,6 @@ function render() {
     imageCell('Populator context image','populator',r.populator_context_image_github_url, r.populator_context_url),
   );
 
-  // Website URLs
-  setLink('servedWebsite',     r.website_url);
-  setLink('populatorWebsite',  r.populator_website_url);
-  document.getElementById('websiteSameBadge').outerHTML = sameBadge(r.website_url, r.populator_website_url, 'websiteSameBadge');
-
   // Alt text
   document.getElementById('existingAlt').textContent  = r.existing_alt_text || '(empty)';
   document.getElementById('generatedAlt').textContent = r.generated_alt_text || '(empty)';
@@ -584,7 +548,6 @@ function render() {
 
   // Render label radios
   renderLabelOptions('bucketOptions', BUCKETS, ann(r).bucket, val => setAnn(r, { bucket: val }));
-  renderLabelOptions('altAccuracyOptions', ALT_ACCURACY, ann(r).alt_accuracy, val => setAnn(r, { alt_accuracy: val }));
 
   // Notes
   document.getElementById('notesField').value = ann(r).notes || '';
@@ -631,7 +594,7 @@ function updateProgress() {
   const total = state.rows.length;
   const labeledCount = state.rows.filter(r => {
     const a = ann(r);
-    return a.bucket && a.alt_accuracy;
+    return !!a.bucket;
   }).length;
 
   const skipped = (state.totalLoaded || 0) - total;
@@ -656,7 +619,7 @@ function jumpToNextUnlabeled() {
   for (let i = 0; i < state.rows.length; i++) {
     const j = (start + i) % state.rows.length;
     const a = ann(state.rows[j]);
-    if (!a.bucket || !a.alt_accuracy) {
+    if (!a.bucket) {
       state.idx = j; render(); return;
     }
   }
@@ -690,15 +653,12 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') nav(-1);
   else if (e.key === 'ArrowRight') nav(1);
   else if (e.key === 'Escape') modal.classList.remove('show');
-  else if (['1','2','3','4'].includes(e.key)) {
-    const opts = ['B1','B2','B3','NA'];
-    setAnn(r, { bucket: opts[parseInt(e.key) - 1] });
+  else if (['1','4'].includes(e.key)) {
+    setAnn(r, { bucket: e.key === '1' ? 'B1' : 'B4' });
     render();
   }
-  else if (['q','w','e','r'].includes(e.key.toLowerCase())) {
-    const opts = ['correct','incorrect','partial','NA'];
-    const map = { q: 0, w: 1, e: 2, r: 3 };
-    setAnn(r, { alt_accuracy: opts[map[e.key.toLowerCase()]] });
+  else if (e.key === '0' || e.key.toLowerCase() === 'n') {
+    setAnn(r, { bucket: 'NA' });
     render();
   }
   else if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
@@ -710,21 +670,19 @@ document.addEventListener('keydown', e => {
 // ----- export -----
 function exportCsv() {
   const headers = [
-    'served_base_image_url',     // GitHub or S3
+    'served_base_image_url',
     'served_context_image_url',
     'populator_base_image_url',
     'populator_context_image_url',
     'cache_key',
     'existing_alt_text',
     'generated_alt_text',
-    'served_website_url',
-    'populator_website_url',
     'served_base_image_etag',
     'served_context_image_etag',
     'populator_base_image_etag',
     'populator_context_image_etag',
+    'group_id',
     'bucket',
-    'alt_accuracy',
     'notes',
   ];
   const rowsOut = state.rows.map(r => {
@@ -737,14 +695,12 @@ function exportCsv() {
       cache_key: r.cache_key || '',
       existing_alt_text: r.existing_alt_text || '',
       generated_alt_text: r.generated_alt_text || '',
-      served_website_url: r.website_url || '',
-      populator_website_url: r.populator_website_url || '',
       served_base_image_etag: r.base_image_etag || '',
       served_context_image_etag: r.context_image_etag || '',
       populator_base_image_etag: r.populator_base_image_etag || '',
       populator_context_image_etag: r.populator_context_image_etag || '',
+      group_id: r.group_id || '',
       bucket: a.bucket || '',
-      alt_accuracy: a.alt_accuracy || '',
       notes: a.notes || '',
     };
   });
