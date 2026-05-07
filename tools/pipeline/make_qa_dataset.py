@@ -148,13 +148,26 @@ def parse_s3_url(url):
     return (bucket, key) if key else (None, None)
 
 
+def webally_fallback_bucket(bucket):
+    """Same image is also written to the WebA11y bucket with longer retention.
+    See https://browserstack.atlassian.net/wiki/spaces/AIA/pages/6194495649
+    Returns the WebA11y bucket name, or None if no rewrite applies.
+    """
+    if not bucket or "a11y-engine-prod" not in bucket:
+        return None
+    return bucket.replace("a11y-engine-prod", "accessibility-prod")
+
+
 # -------- phase 1: BigQuery --------
-def phase_bq_pull(days, raw_csv):
+def phase_bq_pull(days, lookback_days, raw_csv):
+    """`lookback_days` controls how far back to pull jobs to maximise populator
+    coverage (cache TTL refreshes on hits, so populators of recent hits can be
+    much older than `days`)."""
     if os.path.exists(raw_csv) and os.environ.get("FORCE_BQ") != "1":
         log(f"phase 1: cached BQ output exists at {raw_csv} (FORCE_BQ=1 to redo)")
         return
-    job_window = days
-    req_window = days + 1
+    job_window = max(days, lookback_days)
+    req_window = job_window + 1
     log(f"phase 1: pulling {job_window}d of jobs from BigQuery...")
     sql = f"""
 WITH jobs AS (
@@ -255,7 +268,17 @@ def phase_etag_enrich(rows, max_workers=100):
                 resp = s3.head_object(Bucket=bucket, Key=key)
                 return url, (resp.get("ETag") or "").strip('"')
             except ClientError as e:
-                return url, f"ERR:{e.response.get('Error', {}).get('Code', 'X')}"
+                code = e.response.get("Error", {}).get("Code", "X")
+                # Engine bucket has 2-day TTL — fall back to WebA11y bucket (longer retention)
+                if code in ("404", "NoSuchKey", "NotFound"):
+                    fb = webally_fallback_bucket(bucket)
+                    if fb:
+                        try:
+                            resp = s3.head_object(Bucket=fb, Key=key)
+                            return url, (resp.get("ETag") or "").strip('"')
+                        except ClientError as e2:
+                            code = e2.response.get("Error", {}).get("Code", code)
+                return url, f"ERR:{code}"
             except Exception as e:
                 return url, f"ERR:{type(e).__name__}"
 
@@ -421,10 +444,24 @@ def phase_github_mirror(rows, max_workers=20, cleanup_local=False):
         bucket, key = parse_s3_url(s3_url)
         if not bucket:
             return etag, "ERR:bad_url"
+
+        def get(b, k):
+            obj = s3.get_object(Bucket=b, Key=k)
+            return obj["Body"].read(), (obj.get("ContentType") or "")
+
         try:
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            content = obj["Body"].read()
-            ext = sniff_ext(content, obj.get("ContentType") or "")
+            try:
+                content, ct = get(bucket, key)
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("404", "NoSuchKey", "NotFound"):
+                    fb = webally_fallback_bucket(bucket)
+                    if not fb:
+                        raise
+                    content, ct = get(fb, key)
+                else:
+                    raise
+            ext = sniff_ext(content, ct)
             shard = etag[:2]
             rel = f"images/{shard}/{etag}{ext}"
             full = os.path.join(workdir, rel)
@@ -552,9 +589,34 @@ def phase_compute_auto_bucket(rows):
     log(f"phase 3.5: auto-bucket distribution: {counts}")
 
 
-def phase_write_final(rows, out_csv, pairs_only=False, hits_only=False, qa_only=False):
+def _filter_to_days(rows, days):
+    """Keep only rows whose job_created_at is within last `days` days."""
+    import datetime
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    out = []
+    for r in rows:
+        ts = (r.get("job_created_at") or "").strip()
+        if not ts:
+            continue
+        ts_clean = ts.replace(" UTC", "+00:00")
+        if "+00:00" not in ts_clean and ts_clean.endswith("+00"):
+            ts_clean = ts_clean[:-3] + "+00:00"
+        try:
+            dt = datetime.datetime.fromisoformat(ts_clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if dt >= cutoff:
+            out.append(r)
+    return out
+
+
+def phase_write_final(rows, out_csv, days, pairs_only=False, hits_only=False, qa_only=False):
     _join_populator_fields(rows)
     phase_compute_auto_bucket(rows)
+    # Filter output rows to last `days` (we may have pulled more for populator coverage)
+    rows = _filter_to_days(rows, days)
     if qa_only:
         # Only rows that need QA's manual eval: same website + same webpage,
         # excluding BrowserStack's internal test group (group_id=2).
@@ -578,6 +640,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3,
                     help="Window: pull last N days of cache events (default 3)")
+    ap.add_argument("--populator-lookback-days", type=int, default=14,
+                    help="Extend BQ jobs query to this many days so populators of "
+                         "hot cache entries (TTL refreshes on hit) are visible (default 14). "
+                         "WebA11y bucket has long retention so old images are still fetchable.")
     ap.add_argument("--output", default="qa_dataset.csv")
     ap.add_argument("--skip-upload", action="store_true",
                     help="Skip GitHub mirroring (CSV without github_url columns filled)")
@@ -592,8 +658,9 @@ def main():
                     help="Delete the local repo clone after pushing (slower re-runs)")
     args = ap.parse_args()
 
-    raw_csv = os.path.join(CACHE_DIR, f"raw_{args.days}d.csv")
-    phase_bq_pull(args.days, raw_csv)
+    lookback = max(args.days, args.populator_lookback_days)
+    raw_csv = os.path.join(CACHE_DIR, f"raw_{lookback}d.csv")
+    phase_bq_pull(args.days, lookback, raw_csv)
 
     log(f"loading rows from {raw_csv}...")
     with open(raw_csv) as f:
@@ -610,7 +677,7 @@ def main():
             r["base_image_github_url"] = ""
             r["context_image_github_url"] = ""
 
-    phase_write_final(rows, args.output,
+    phase_write_final(rows, args.output, args.days,
                       pairs_only=args.pairs_only,
                       hits_only=args.hits_only,
                       qa_only=args.qa_only)
