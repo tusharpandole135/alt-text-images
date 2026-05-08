@@ -390,21 +390,20 @@
   <img id="modalImg" alt="">
 </div>
 
-<div class="keyboard-hint">← → navigate · 1 = B1 · 4 = B4 · N = NA · Cmd+S = export</div>
+<div class="keyboard-hint">← → navigate · 1 = B1 (TP) · 2 = B2 (different context) · Cmd+S = export</div>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script>
 const STORAGE_KEY = 'cacheQaEvalAnnotations_v1';
 
-// Only the buckets QA needs to manually distinguish (same website + same webpage).
-// "different website" (B2) and "different webpage" (B3) are auto-classified by the pipeline.
+// QA only sees rows that are: same website + same webpage.
+// They distinguish whether the context image is also the same (TP) or different (potential FP).
+// Cross-site (B3) and cross-page (B4) are auto-classified by the pipeline — not shown here.
 const BUCKETS = [
-  { key: 'B1', label: 'Bucket 1 — Same base, different context',
-    desc: 'Context image differs — possible FP' },
-  { key: 'B4', label: 'Bucket 4 — Same everything (TP)',
-    desc: 'Cache hit fully justified — context same' },
-  { key: 'NA', label: 'NA / Cannot determine',
-    desc: 'Image unclear / cannot tell' },
+  { key: 'B1', label: 'Bucket 1 — Same context (TP)',
+    desc: 'Both rows show the same context image' },
+  { key: 'B2', label: 'Bucket 2 — Different context',
+    desc: 'Context images differ — potential FP' },
 ];
 
 const state = {
@@ -459,23 +458,15 @@ function loadFile(file) {
       const all = results.data;
       // Filter: must have BOTH served + populator info
       const isHttp = u => typeof u === 'string' && u.startsWith('http');
-      const filtered = all.filter(r => {
-        const isServed = (r.cache_role || '').trim() === 'served' ||
-                         (r.cache_hit || '').toLowerCase() === 'true';
-        // Skip rows the pipeline already auto-classified (B2 cross-site, B3 cross-page)
-        // — QA only sees rows where the bucket truly needs visual judgment.
-        const ab = (r.auto_bucket || '').trim();
-        const needsManual = ab === 'manual_eval' || ab === '';
-        // Exclude BrowserStack's internal test group from QA eval.
-        const notInternal = String(r.group_id || '').trim() !== '2';
-        // All 4 images must be loadable on GitHub.
-        const allImagesOk =
-          isHttp(r.base_image_github_url) &&
-          isHttp(r.context_image_github_url) &&
-          isHttp(r.populator_base_image_github_url) &&
-          isHttp(r.populator_context_image_github_url);
-        return isServed && needsManual && notInternal && allImagesOk;
-      });
+      // The pipeline already pre-filters rows for manual eval (B1/B2 candidates),
+      // excludes group_id=2, and only includes rows where all 4 GitHub URLs exist.
+      // The check below is a defensive safety net.
+      const filtered = all.filter(r =>
+        isHttp(r.base_image_github_url) &&
+        isHttp(r.context_image_github_url) &&
+        isHttp(r.populator_base_image_github_url) &&
+        isHttp(r.populator_context_image_github_url)
+      );
       state.rows = filtered;
       state.totalLoaded = all.length;
       state.idx = 0;
@@ -653,12 +644,8 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') nav(-1);
   else if (e.key === 'ArrowRight') nav(1);
   else if (e.key === 'Escape') modal.classList.remove('show');
-  else if (['1','4'].includes(e.key)) {
-    setAnn(r, { bucket: e.key === '1' ? 'B1' : 'B4' });
-    render();
-  }
-  else if (e.key === '0' || e.key.toLowerCase() === 'n') {
-    setAnn(r, { bucket: 'NA' });
+  else if (['1','2'].includes(e.key)) {
+    setAnn(r, { bucket: e.key === '1' ? 'B1' : 'B2' });
     render();
   }
   else if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
