@@ -112,6 +112,40 @@ POPULATOR_JOIN_FIELDS = [
 ]
 
 
+# Lean column set sent to the QA tool (manual eval — buckets 1 & 2)
+QA_OUTPUT_FIELDS = [
+    "image_id",
+    "request_id",
+    "group_id",
+    "cache_key",
+    "existing_alt_text",
+    "generated_alt_text",
+    "language",
+    # served (cache hit) row
+    "base_url",
+    "context_url",
+    "base_image_etag",
+    "context_image_etag",
+    "base_image_github_url",
+    "context_image_github_url",
+    # populator row (joined)
+    "populator_base_url",
+    "populator_context_url",
+    "populator_base_image_etag",
+    "populator_context_image_etag",
+    "populator_base_image_github_url",
+    "populator_context_image_github_url",
+]
+
+# Auto-classified rows (B3 / B4) — already have their bucket pre-filled
+AUTO_OUTPUT_FIELDS = QA_OUTPUT_FIELDS + [
+    "bucket",
+    "auto_bucket",
+    "website_url",
+    "populator_website_url",
+]
+
+
 # -------- helpers --------
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -159,15 +193,12 @@ def webally_fallback_bucket(bucket):
 
 
 # -------- phase 1: BigQuery --------
-def phase_bq_pull(days, lookback_days, raw_csv):
-    """`lookback_days` controls how far back to pull jobs to maximise populator
-    coverage (cache TTL refreshes on hits, so populators of recent hits can be
-    much older than `days`)."""
+def phase_bq_pull(days, raw_csv):
     if os.path.exists(raw_csv) and os.environ.get("FORCE_BQ") != "1":
         log(f"phase 1: cached BQ output exists at {raw_csv} (FORCE_BQ=1 to redo)")
         return
-    job_window = max(days, lookback_days)
-    req_window = job_window + 1
+    job_window = days
+    req_window = days + 1
     log(f"phase 1: pulling {job_window}d of jobs from BigQuery...")
     sql = f"""
 WITH jobs AS (
@@ -241,66 +272,94 @@ ORDER BY j.job_created_at DESC
 
 
 # -------- phase 2: ETag enrichment --------
-def phase_etag_enrich(rows, max_workers=100):
+def _fetch_etags_via_boto(urls_needed, cache, max_workers, label=""):
+    """Run head_object for each URL with WebA11y bucket fallback. Mutates `cache`."""
+    if not urls_needed:
+        return
+    cfg = Config(max_pool_connections=max_workers + 4,
+                 retries={"max_attempts": 2, "mode": "standard"},
+                 connect_timeout=8, read_timeout=12)
+    s3 = boto3.client("s3", region_name=S3_REGION, config=cfg)
+    lock = threading.Lock()
+
+    def head(url):
+        # Try WebA11y bucket FIRST — has both fresh + old objects (long retention).
+        # Engine bucket is 2-day TTL only, so skipping it as primary avoids 86% of
+        # 404 RTTs for a 14-day window.
+        eng_bucket, key = parse_s3_url(url)
+        if not eng_bucket:
+            return url, ""
+        wa = webally_fallback_bucket(eng_bucket) or eng_bucket
+        try:
+            resp = s3.head_object(Bucket=wa, Key=key)
+            return url, (resp.get("ETag") or "").strip('"')
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "X")
+            if code in ("404", "NoSuchKey", "NotFound") and wa != eng_bucket:
+                # WebA11y miss — try engine bucket as fallback
+                try:
+                    resp = s3.head_object(Bucket=eng_bucket, Key=key)
+                    return url, (resp.get("ETag") or "").strip('"')
+                except ClientError as e2:
+                    code = e2.response.get("Error", {}).get("Code", code)
+            return url, f"ERR:{code}"
+        except Exception as e:
+            return url, f"ERR:{type(e).__name__}"
+
+    done = 0
+    save_every = 5000
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(head, u) for u in urls_needed]
+        for fut in as_completed(futures):
+            u, etag = fut.result()
+            with lock:
+                cache[u] = etag
+            done += 1
+            if done % save_every == 0 or done == len(urls_needed):
+                save_cache(ETAG_CACHE, cache)
+                log(f"  {label} fetched {done}/{len(urls_needed)} ETags")
+    save_cache(ETAG_CACHE, cache)
+
+
+def phase_etag_enrich(rows, max_workers=200):
+    """Two-pass ETag enrichment for speed:
+       Pass 1 — all base URLs (needed for cache_key grouping).
+       Pass 2 — context URLs only for cache hits + their populators (after pair compute)."""
     cache = load_cache(ETAG_CACHE)
-    log(f"phase 2: ETag cache has {len(cache)} entries")
+    log(f"phase 2a: ETag cache has {len(cache)} entries")
 
-    urls_needed = set()
+    base_needed = set()
     for r in rows:
-        for k in ("base_url", "context_url"):
-            u = r.get(k) or ""
-            if u and u not in cache:
-                urls_needed.add(u)
-    log(f"phase 2: {len(urls_needed)} new URLs to head")
+        u = r.get("base_url") or ""
+        if u and u not in cache:
+            base_needed.add(u)
+    log(f"phase 2a: {len(base_needed)} new BASE URLs to head")
+    _fetch_etags_via_boto(base_needed, cache, max_workers, label="base")
 
-    if urls_needed:
-        cfg = Config(max_pool_connections=max_workers + 4,
-                     retries={"max_attempts": 3, "mode": "standard"},
-                     connect_timeout=10, read_timeout=15)
-        s3 = boto3.client("s3", region_name=S3_REGION, config=cfg)
-        lock = threading.Lock()
-
-        def head(url):
-            bucket, key = parse_s3_url(url)
-            if not bucket:
-                return url, ""
-            try:
-                resp = s3.head_object(Bucket=bucket, Key=key)
-                return url, (resp.get("ETag") or "").strip('"')
-            except ClientError as e:
-                code = e.response.get("Error", {}).get("Code", "X")
-                # Engine bucket has 2-day TTL — fall back to WebA11y bucket (longer retention)
-                if code in ("404", "NoSuchKey", "NotFound"):
-                    fb = webally_fallback_bucket(bucket)
-                    if fb:
-                        try:
-                            resp = s3.head_object(Bucket=fb, Key=key)
-                            return url, (resp.get("ETag") or "").strip('"')
-                        except ClientError as e2:
-                            code = e2.response.get("Error", {}).get("Code", code)
-                return url, f"ERR:{code}"
-            except Exception as e:
-                return url, f"ERR:{type(e).__name__}"
-
-        done = 0
-        save_every = 2000
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(head, u) for u in urls_needed]
-            for fut in as_completed(futures):
-                u, etag = fut.result()
-                with lock:
-                    cache[u] = etag
-                done += 1
-                if done % save_every == 0:
-                    save_cache(ETAG_CACHE, cache)
-                    log(f"  fetched {done}/{len(urls_needed)} ETags")
-        save_cache(ETAG_CACHE, cache)
-
-    # fill rows
+    # Fill base etags now; context etags filled later in phase 2b
     for r in rows:
         r["base_image_etag"] = cache.get(r.get("base_url") or "", "")
         r["context_image_etag"] = cache.get(r.get("context_url") or "", "")
-    log(f"phase 2: done")
+    log(f"phase 2a: done")
+
+
+def phase_etag_enrich_context(rows, max_workers=200):
+    """Pass 2: context URLs for served rows + populators of those served rows.
+       Cache misses without any hit in their group don't get context ETag (saves
+       ~95% of work)."""
+    cache = load_cache(ETAG_CACHE)
+    needed = set()
+    for r in rows:
+        # served (cache hit) AND populator-relevant rows
+        if r.get("cache_role") in ("served",) or r.get("_pair_relevant"):
+            u = r.get("context_url") or ""
+            if u and u not in cache:
+                needed.add(u)
+    log(f"phase 2b: {len(needed)} new CONTEXT URLs to head (served + pair-relevant only)")
+    _fetch_etags_via_boto(needed, cache, max_workers, label="context")
+    # refresh context etags on all rows
+    for r in rows:
+        r["context_image_etag"] = cache.get(r.get("context_url") or "", "")
 
 
 # -------- phase 3: pair computation --------
@@ -413,9 +472,29 @@ def phase_github_mirror(rows, max_workers=20, cleanup_local=False):
     cache = load_cache(GITHUB_CACHE)
     log(f"phase 4: GitHub cache has {len(cache)} entries")
 
+    # Build set of QA-target rows: served (cache hit) rows that are manual_eval
+    # bucket and not BrowserStack internal (group_id 2). Plus the populator they
+    # paired with. We mirror images only for these — saves huge time on big pulls.
+    qa_target_image_ids = set()
+    populator_ids_needed = set()
+    for r in rows:
+        if r.get("cache_role") != "served":
+            continue
+        if r.get("auto_bucket") != "manual_eval":
+            continue
+        if str(r.get("group_id") or "").strip() == "2":
+            continue
+        qa_target_image_ids.add(r.get("image_id") or "")
+        psi = r.get("paired_source_image_id") or ""
+        if psi:
+            populator_ids_needed.add(psi)
+
+    qa_relevant_ids = qa_target_image_ids | populator_ids_needed
+    log(f"phase 4: QA-target rows: {len(qa_target_image_ids)} served + {len(populator_ids_needed)} populator image_ids")
+
     todo = {}  # etag -> s3_url
     for r in rows:
-        if not r.get("_pair_relevant"):
+        if r.get("image_id") not in qa_relevant_ids:
             continue
         for url_k, etag_k in (("base_url", "base_image_etag"), ("context_url", "context_image_etag")):
             etag = r.get(etag_k) or ""
@@ -428,6 +507,8 @@ def phase_github_mirror(rows, max_workers=20, cleanup_local=False):
     log(f"phase 4: {len(todo)} unique images to mirror")
 
     if not todo:
+        # Nothing new to upload — skip clone/push entirely (saves minutes).
+        log("phase 4: nothing to upload, skipping git clone/push")
         _fill_github_urls_in_rows(rows, cache)
         return
 
@@ -441,9 +522,10 @@ def phase_github_mirror(rows, max_workers=20, cleanup_local=False):
     fail = 0
 
     def fetch(etag, s3_url):
-        bucket, key = parse_s3_url(s3_url)
-        if not bucket:
+        eng_bucket, key = parse_s3_url(s3_url)
+        if not eng_bucket:
             return etag, "ERR:bad_url"
+        wa = webally_fallback_bucket(eng_bucket) or eng_bucket
 
         def get(b, k):
             obj = s3.get_object(Bucket=b, Key=k)
@@ -451,14 +533,11 @@ def phase_github_mirror(rows, max_workers=20, cleanup_local=False):
 
         try:
             try:
-                content, ct = get(bucket, key)
+                content, ct = get(wa, key)
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
-                if code in ("404", "NoSuchKey", "NotFound"):
-                    fb = webally_fallback_bucket(bucket)
-                    if not fb:
-                        raise
-                    content, ct = get(fb, key)
+                if code in ("404", "NoSuchKey", "NotFound") and wa != eng_bucket:
+                    content, ct = get(eng_bucket, key)
                 else:
                     raise
             ext = sniff_ext(content, ct)
@@ -560,24 +639,27 @@ def _normalize_url_parts(url):
 
 
 def _compute_auto_bucket(served_url, pop_url):
-    """Auto-classify pair similarity from website URLs alone.
-    Returns one of: B2_diff_website, B3_diff_webpage, manual_eval (B1/B4 needed),
-    or 'unknown' when URLs are missing.
+    """Classify the served-vs-populator pair from website URLs alone.
+    Returns:
+      B3_diff_website   = different domain
+      B4_diff_webpage   = same domain, different path
+      manual_eval       = same domain + same path (QA decides B1 same-context vs B2 different-context)
+      unknown           = website URL missing on one side
     """
     s_host, s_path = _normalize_url_parts(served_url)
     p_host, p_path = _normalize_url_parts(pop_url)
     if not s_host or not p_host:
         return "unknown"
     if s_host != p_host:
-        return "B2_diff_website"
+        return "B3_diff_website"
     if s_path != p_path:
-        return "B3_diff_webpage"
+        return "B4_diff_webpage"
     return "manual_eval"
 
 
 def phase_compute_auto_bucket(rows):
     log("phase 3.5: auto-classifying buckets from URLs...")
-    counts = {"B2_diff_website": 0, "B3_diff_webpage": 0, "manual_eval": 0, "unknown": 0, "n/a": 0}
+    counts = {"B3_diff_website": 0, "B4_diff_webpage": 0, "manual_eval": 0, "unknown": 0, "n/a": 0}
     for r in rows:
         if r.get("cache_role") != "served":
             r["auto_bucket"] = ""
@@ -612,26 +694,52 @@ def _filter_to_days(rows, days):
     return out
 
 
-def phase_write_final(rows, out_csv, days, pairs_only=False, hits_only=False, qa_only=False):
-    _join_populator_fields(rows)
-    phase_compute_auto_bucket(rows)
-    # Filter output rows to last `days` (we may have pulled more for populator coverage)
-    rows = _filter_to_days(rows, days)
-    if qa_only:
-        # Only rows that need QA's manual eval: same website + same webpage,
-        # excluding BrowserStack's internal test group (group_id=2).
-        rows = [r for r in rows
-                if r.get("auto_bucket") == "manual_eval"
-                and str(r.get("group_id") or "").strip() != "2"]
-    elif hits_only:
-        rows = [r for r in rows if r.get("cache_role") == "served"]
-    elif pairs_only:
-        rows = [r for r in rows if r.get("_pair_relevant")]
+def _has_all_4_images(r):
+    return all((r.get(k) or "").startswith("http") for k in (
+        "base_image_github_url", "context_image_github_url",
+        "populator_base_image_github_url", "populator_context_image_github_url"))
+
+
+def _write_csv(rows, out_csv, fields):
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FINAL_FIELDS, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow(r)
+
+
+def phase_write_final(rows, out_csv, auto_csv, days, pairs_only=False, hits_only=False, qa_only=False):
+    _join_populator_fields(rows)
+    rows = _filter_to_days(rows, days)
+
+    if qa_only:
+        # Two outputs:
+        #   1. qa_for_eval.csv  — manual-eval candidates (B1/B2): same site + same page
+        #      Excludes group_id=2 (BS internal). Strict: all 4 images visible.
+        #   2. auto_classified.csv  — pre-classified B3 (cross-site) + B4 (cross-page)
+        is_real_customer = lambda r: str(r.get("group_id") or "").strip() != "2"
+        manual_rows = [r for r in rows
+                       if r.get("auto_bucket") == "manual_eval"
+                       and is_real_customer(r)
+                       and _has_all_4_images(r)]
+        auto_rows = [r for r in rows
+                     if r.get("auto_bucket") in ("B3_diff_website", "B4_diff_webpage")
+                     and is_real_customer(r)]
+        # pre-fill bucket for auto rows (QA gets a complete picture per row)
+        bucket_map = {"B3_diff_website": "B3", "B4_diff_webpage": "B4"}
+        for r in auto_rows:
+            r["bucket"] = bucket_map.get(r.get("auto_bucket"), "")
+        _write_csv(manual_rows, out_csv, QA_OUTPUT_FIELDS)
+        _write_csv(auto_rows, auto_csv, AUTO_OUTPUT_FIELDS)
+        log(f"phase 5: wrote {len(manual_rows)} rows to {out_csv} (QA manual eval)")
+        log(f"phase 5: wrote {len(auto_rows)} rows to {auto_csv} (auto-classified B3/B4)")
+        return
+
+    if hits_only:
+        rows = [r for r in rows if r.get("cache_role") == "served"]
+    elif pairs_only:
+        rows = [r for r in rows if r.get("_pair_relevant")]
+    _write_csv(rows, out_csv, FINAL_FIELDS)
     log(f"phase 5: wrote {len(rows)} rows to {out_csv}")
 
 
@@ -640,11 +748,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3,
                     help="Window: pull last N days of cache events (default 3)")
-    ap.add_argument("--populator-lookback-days", type=int, default=14,
-                    help="Extend BQ jobs query to this many days so populators of "
-                         "hot cache entries (TTL refreshes on hit) are visible (default 14). "
-                         "WebA11y bucket has long retention so old images are still fetchable.")
-    ap.add_argument("--output", default="qa_dataset.csv")
+    ap.add_argument("--output", default="qa_for_eval.csv",
+                    help="Output CSV path for QA manual eval (B1/B2 candidates)")
+    ap.add_argument("--auto-output", default="auto_classified.csv",
+                    help="Output CSV path for rows auto-classified as B3 (cross-site) "
+                         "or B4 (cross-page). Only written in --qa-only mode.")
     ap.add_argument("--skip-upload", action="store_true",
                     help="Skip GitHub mirroring (CSV without github_url columns filled)")
     ap.add_argument("--pairs-only", action="store_true",
@@ -654,30 +762,35 @@ def main():
     ap.add_argument("--qa-only", action="store_true",
                     help="Only output rows that need QA's manual eval (same website + same webpage). "
                          "Auto-classifies cross-site / cross-page pairs and excludes group_id=2.")
-    ap.add_argument("--cleanup-local", action="store_true",
-                    help="Delete the local repo clone after pushing (slower re-runs)")
+    ap.add_argument("--cleanup-local", action="store_true", default=False,
+                    help="Delete the local repo clone after pushing (saves ~4 GB disk). "
+                         "Default OFF — keeps clone for fast re-runs. Use only if disk is tight.")
     args = ap.parse_args()
 
-    lookback = max(args.days, args.populator_lookback_days)
-    raw_csv = os.path.join(CACHE_DIR, f"raw_{lookback}d.csv")
-    phase_bq_pull(args.days, lookback, raw_csv)
+    raw_csv = os.path.join(CACHE_DIR, f"raw_{args.days}d.csv")
+    phase_bq_pull(args.days, raw_csv)
 
     log(f"loading rows from {raw_csv}...")
     with open(raw_csv) as f:
         rows = list(csv.DictReader(f))
     log(f"loaded {len(rows)} rows")
 
-    phase_etag_enrich(rows)
+    phase_etag_enrich(rows)            # pass 1: base URLs only
     phase_compute_pairs(rows)
+    _join_populator_fields(rows)        # populator data side-by-side (uses image_id index)
+    phase_compute_auto_bucket(rows)     # B2/B3 classification needs populator_website_url
+    phase_etag_enrich_context(rows)    # pass 2: context URLs of served + populators only
 
     if not args.skip_upload:
         phase_github_mirror(rows, cleanup_local=args.cleanup_local)
     else:
-        for r in rows:
-            r["base_image_github_url"] = ""
-            r["context_image_github_url"] = ""
+        # Still populate github_url columns from existing cache; just don't upload
+        # anything new (no clone, no push). Images already mirrored will resolve.
+        gh_cache = load_cache(GITHUB_CACHE)
+        log(f"--skip-upload: using existing GitHub cache ({len(gh_cache)} entries)")
+        _fill_github_urls_in_rows(rows, gh_cache)
 
-    phase_write_final(rows, args.output, args.days,
+    phase_write_final(rows, args.output, args.auto_output, args.days,
                       pairs_only=args.pairs_only,
                       hits_only=args.hits_only,
                       qa_only=args.qa_only)
