@@ -459,11 +459,12 @@ def ensure_repo_clone(workdir):
         return
     log(f"  cloning {GITHUB_REPO} to {workdir}")
     os.makedirs(os.path.dirname(workdir), exist_ok=True)
-    # use gh-injected credentials via https
     token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True).stdout.strip()
     clone_url = f"https://x-access-token:{token}@github.com/{GITHUB_REPO}.git"
-    run_git(["clone", "--depth=1", "--branch", GITHUB_BRANCH, clone_url, workdir])
-    # ensure user identity for commits
+    # Partial clone (--filter=blob:none) skips downloading existing image blobs
+    # (only metadata + tree). Avoids re-downloading 4 GB of past images.
+    run_git(["clone", "--depth=1", "--filter=blob:none",
+             "--branch", GITHUB_BRANCH, clone_url, workdir])
     run_git(["config", "user.email", "tushar.p@browserstack.com"], cwd=workdir)
     run_git(["config", "user.name", "QA Dataset Bot"], cwd=workdir)
 
@@ -626,7 +627,8 @@ def _join_populator_fields(rows):
 
 
 def _normalize_url_parts(url):
-    """Return (hostname, path) lowercase, no trailing slash. None on parse error."""
+    """Return (hostname, path) lowercase, no trailing slash, www-stripped.
+    None on parse error."""
     if not url:
         return None, None
     try:
@@ -634,6 +636,9 @@ def _normalize_url_parts(url):
     except Exception:
         return None, None
     host = (u.hostname or "").lower()
+    # Treat www.example.com and example.com as the same site
+    if host.startswith("www."):
+        host = host[4:]
     path = (u.path or "").rstrip("/")
     return host, path
 

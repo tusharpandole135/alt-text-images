@@ -458,9 +458,6 @@ function loadFile(file) {
       const all = results.data;
       // Filter: must have BOTH served + populator info
       const isHttp = u => typeof u === 'string' && u.startsWith('http');
-      // The pipeline already pre-filters rows for manual eval (B1/B2 candidates),
-      // excludes group_id=2, and only includes rows where all 4 GitHub URLs exist.
-      // The check below is a defensive safety net.
       const filtered = all.filter(r =>
         isHttp(r.base_image_github_url) &&
         isHttp(r.context_image_github_url) &&
